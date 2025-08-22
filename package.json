@@ -1,0 +1,23 @@
+{
+  "name": "peer-to-peer-file-transfer",
+  "version": "1.0.0",
+  "description": "A peer-to-peer file transfer webapp",
+  "private": true,
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:frontend": "npm run dev --workspace=frontend",
+    "dev:backend": "npm run dev --workspace=backend",
+    "build": "npm run build --workspace=frontend && npm run build --workspace=backend",
+    "install:all": "npm install && npm install --workspace=frontend && npm install --workspace=backend"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "keywords": ["peer-to-peer", "file-transfer", "webrtc", "react", "nodejs"],
+  "author": "",
+  "license": "MIT"
+}
