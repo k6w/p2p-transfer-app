@@ -10,7 +10,8 @@ const server = createServer(app);
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 const PORT = process.env.PORT || 3001;
 const MAX_ROOMS = 1000;
-const MAX_PARTICIPANTS_PER_ROOM = 2;
+const DEFAULT_MAX_RECEIVERS = 1;
+const ABSOLUTE_MAX_RECEIVERS = 50;
 const ROOM_TTL_HOURS = 24;
 const EMPTY_ROOM_CLEANUP_MS = 5 * 60 * 1000;
 
@@ -73,18 +74,25 @@ app.post('/create-room', rateLimit, (req, res) => {
     return res.status(503).json({ error: 'Server is at capacity, try again later' });
   }
 
+  let maxReceivers = DEFAULT_MAX_RECEIVERS;
+  if (req.body && typeof req.body.maxReceivers === 'number') {
+    maxReceivers = Math.max(1, Math.min(Math.floor(req.body.maxReceivers), ABSOLUTE_MAX_RECEIVERS));
+  }
+
   const roomId = uuidv4();
   rooms.set(roomId, {
     id: roomId,
     participants: [],
     createdAt: new Date(),
     fileInfo: null,
-    multipleFilesInfo: null
+    multipleFilesInfo: null,
+    maxReceivers
   });
 
   res.json({
     roomId,
-    shareUrl: `${FRONTEND_URL}/receive/${roomId}`
+    shareUrl: `${FRONTEND_URL}/receive/${roomId}`,
+    maxReceivers
   });
 });
 
@@ -104,6 +112,7 @@ app.get('/room/:roomId', (req, res) => {
   res.json({
     roomId: room.id,
     participantCount: room.participants.length,
+    maxReceivers: room.maxReceivers,
     hasFile: !!(room.fileInfo || room.multipleFilesInfo),
     fileInfo: room.fileInfo,
     multipleFilesInfo: room.multipleFilesInfo
@@ -113,19 +122,20 @@ app.get('/room/:roomId', (req, res) => {
 io.on('connection', (socket) => {
   socket.on('join-room', (roomId) => {
     if (!roomId || typeof roomId !== 'string' || !uuidValidate(roomId)) {
-      socket.emit('error', 'Invalid room ID');
+      socket.emit('error', 'invalid room id');
       return;
     }
 
     const room = rooms.get(roomId);
     if (!room) {
-      socket.emit('error', 'Room not found');
+      socket.emit('error', 'room not found');
       return;
     }
 
-    if (room.participants.length >= MAX_PARTICIPANTS_PER_ROOM &&
+    const maxTotal = 1 + room.maxReceivers;
+    if (room.participants.length >= maxTotal &&
         !room.participants.find(p => p.id === socket.id)) {
-      socket.emit('error', 'Room is full');
+      socket.emit('error', 'room is full');
       return;
     }
 
@@ -163,6 +173,7 @@ io.on('connection', (socket) => {
     socket.emit('room-joined', {
       roomId,
       participantCount: room.participants.length,
+      maxReceivers: room.maxReceivers,
       fileInfo: room.fileInfo,
       multipleFilesInfo: room.multipleFilesInfo
     });

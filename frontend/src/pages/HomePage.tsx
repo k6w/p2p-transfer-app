@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Upload, Share2, FileText, Loader2, X, Lock, Files, Copy, Check, RotateCcw } from 'lucide-react';
+import { Upload, Share2, FileText, Loader2, X, Lock, Files, Copy, Check, RotateCcw, Users, Minus, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
@@ -25,6 +25,7 @@ export function HomePage() {
   const [isDragging, setIsDragging] = useState(false);
   const [copied, setCopied] = useState(false);
   const [waitingForPasscode, setWaitingForPasscode] = useState(false);
+  const [maxReceivers, setMaxReceivers] = useState(1);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const webrtcRef = useRef<WebRTCService | null>(null);
   const roomIdRef = useRef<string | null>(null);
@@ -79,7 +80,7 @@ export function HomePage() {
 
     setIsCreatingRoom(true);
     try {
-      const { roomId, shareUrl } = await ApiService.createRoom();
+      const { roomId, shareUrl } = await ApiService.createRoom(maxReceivers);
       setShareUrl(shareUrl);
       roomIdRef.current = roomId;
 
@@ -188,6 +189,7 @@ export function HomePage() {
     setPasscode('');
     setCopied(false);
     setWaitingForPasscode(false);
+    setMaxReceivers(1);
     if (webrtcRef.current) {
       webrtcRef.current.disconnect();
       webrtcRef.current = null;
@@ -348,6 +350,34 @@ export function HomePage() {
                   </div>
                 )}
 
+                <div className="flex items-center justify-between p-2">
+                  <label className="text-sm sm:text-base font-medium flex items-center gap-2">
+                    <Users className="h-4 w-4" />
+                    max receivers
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 w-8 p-0"
+                      onClick={(e) => { e.stopPropagation(); setMaxReceivers(prev => Math.max(1, prev - 1)); }}
+                      disabled={maxReceivers <= 1}
+                    >
+                      <Minus className="h-3 w-3" />
+                    </Button>
+                    <span className="text-sm font-mono w-6 text-center">{maxReceivers}</span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 w-8 p-0"
+                      onClick={(e) => { e.stopPropagation(); setMaxReceivers(prev => Math.min(50, prev + 1)); }}
+                      disabled={maxReceivers >= 50}
+                    >
+                      <Plus className="h-3 w-3" />
+                    </Button>
+                  </div>
+                </div>
+
                 <div className="space-y-3">
                   <Button
                     onClick={createShareLink}
@@ -435,7 +465,7 @@ export function HomePage() {
                 <div className="flex items-center justify-between">
                   <span className="text-sm font-medium">participants:</span>
                   <span className="text-sm text-muted-foreground">
-                    {participantCount}/2
+                    {participantCount}/{1 + maxReceivers}
                   </span>
                 </div>
 

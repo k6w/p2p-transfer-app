@@ -3,11 +3,13 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 export interface CreateRoomResponse {
   roomId: string;
   shareUrl: string;
+  maxReceivers: number;
 }
 
 export interface RoomInfo {
   roomId: string;
   participantCount: number;
+  maxReceivers: number;
   hasFile: boolean;
   fileInfo?: {
     name: string;
@@ -27,12 +29,13 @@ export interface RoomInfo {
 }
 
 export class ApiService {
-  static async createRoom(): Promise<CreateRoomResponse> {
+  static async createRoom(maxReceivers = 1): Promise<CreateRoomResponse> {
     const response = await fetch(`${API_BASE_URL}/create-room`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
+      body: JSON.stringify({ maxReceivers }),
     });
 
     if (!response.ok) {

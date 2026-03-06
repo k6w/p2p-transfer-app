@@ -34,6 +34,7 @@ export function ReceivePage() {
   const [passcodeValidated, setPasscodeValidated] = useState(false);
   const [allFilesReceived, setAllFilesReceived] = useState(false);
   const [passcodeError, setPasscodeError] = useState(false);
+  const [maxReceivers, setMaxReceivers] = useState(1);
   const initedRef = useRef(false);
 
   useEffect(() => {
@@ -63,6 +64,7 @@ export function ReceivePage() {
       setLoading(true);
       const info = await ApiService.getRoomInfo(roomId!);
       setRoomInfo(info);
+      if (info.maxReceivers) setMaxReceivers(info.maxReceivers);
 
       if (info.multipleFilesInfo) {
         if (info.multipleFilesInfo.hasPasscode) {
@@ -409,7 +411,7 @@ export function ReceivePage() {
                 <div className="flex items-center justify-between">
                   <span className="text-sm sm:text-base font-medium">participants:</span>
                   <span className="text-sm sm:text-base text-muted-foreground">
-                    {participantCount}/2
+                    {participantCount}/{1 + maxReceivers}
                   </span>
                 </div>
               )}
