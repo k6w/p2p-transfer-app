@@ -35,6 +35,7 @@ export function ReceivePage() {
   const [allFilesReceived, setAllFilesReceived] = useState(false);
   const [passcodeError, setPasscodeError] = useState(false);
   const [maxReceivers, setMaxReceivers] = useState(1);
+  const [submittingPasscode, setSubmittingPasscode] = useState(false);
   const initedRef = useRef(false);
 
   useEffect(() => {
@@ -175,14 +176,16 @@ export function ReceivePage() {
     toast.success(`downloading ${receivedFiles.length} files`);
   };
 
-  const handlePasscodeSubmit = () => {
+  const handlePasscodeSubmit = async () => {
     if (!webrtcRef.current || passcode.length !== 6) {
       toast.error('enter a 6-digit passcode');
       return;
     }
 
     setPasscodeError(false);
-    webrtcRef.current.submitPasscode(passcode);
+    setSubmittingPasscode(true);
+    await webrtcRef.current.submitPasscode(passcode);
+    setSubmittingPasscode(false);
   };
 
   const getStatusText = () => {
@@ -296,10 +299,17 @@ export function ReceivePage() {
                 )}
                 <Button
                   onClick={handlePasscodeSubmit}
-                  disabled={passcode.length !== 6}
+                  disabled={passcode.length !== 6 || submittingPasscode}
                   className="w-full h-12 text-base"
                 >
-                  submit passcode
+                  {submittingPasscode ? (
+                    <>
+                      <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                      connecting...
+                    </>
+                  ) : (
+                    'submit passcode'
+                  )}
                 </Button>
               </div>
             </CardContent>

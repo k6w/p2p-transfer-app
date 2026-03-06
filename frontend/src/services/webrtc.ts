@@ -172,11 +172,8 @@ export class WebRTCService {
     channel.bufferedAmountLowThreshold = 8 * 1024 * 1024;
 
     channel.onopen = () => {
+      this.resolveDataChannelWaiters();
       this.onDataChannelOpen?.();
-      for (const resolve of this.dataChannelReadyResolvers) {
-        resolve();
-      }
-      this.dataChannelReadyResolvers = [];
     };
 
     channel.onclose = () => {
@@ -190,6 +187,18 @@ export class WebRTCService {
     channel.onerror = () => {
       this.onError?.('data channel error');
     };
+
+    if (channel.readyState === 'open') {
+      this.resolveDataChannelWaiters();
+      this.onDataChannelOpen?.();
+    }
+  }
+
+  private resolveDataChannelWaiters() {
+    for (const resolve of this.dataChannelReadyResolvers) {
+      resolve();
+    }
+    this.dataChannelReadyResolvers = [];
   }
 
   private receivedChunks: ArrayBuffer[] = [];
@@ -303,16 +312,27 @@ export class WebRTCService {
   }
 
   async submitPasscode(passcode: string) {
-    const isReady = await this.waitForDataChannel();
-    if (!isReady || !this.dataChannel) {
-      this.onError?.('not connected to sender yet. try again.');
+    if (this.dataChannel?.readyState !== 'open') {
+      const isReady = await this.waitForDataChannel();
+      if (!isReady) {
+        this.onError?.('not connected to sender yet. try again.');
+        return;
+      }
+    }
+
+    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+      this.onError?.('connection lost. try again.');
       return;
     }
 
-    this.dataChannel.send(JSON.stringify({
-      type: 'passcode-submit',
-      passcode,
-    }));
+    try {
+      this.dataChannel.send(JSON.stringify({
+        type: 'passcode-submit',
+        passcode,
+      }));
+    } catch {
+      this.onError?.('failed to send passcode. try again.');
+    }
   }
 
   private reconstructFile() {
