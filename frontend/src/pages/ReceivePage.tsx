@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Download, FileText, Loader2, AlertCircle, CheckCircle, Home, Lock, Files } from 'lucide-react';
+import { Download, FileText, Loader2, AlertCircle, Home, Lock, Files } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
@@ -33,10 +33,11 @@ export function ReceivePage() {
   const [passcode, setPasscode] = useState('');
   const [passcodeValidated, setPasscodeValidated] = useState(false);
   const [allFilesReceived, setAllFilesReceived] = useState(false);
+  const [passcodeError, setPasscodeError] = useState(false);
 
   useEffect(() => {
     if (!roomId) {
-      setError('Invalid room ID');
+      setError('invalid room id');
       setLoading(false);
       return;
     }
@@ -58,15 +59,14 @@ export function ReceivePage() {
       const info = await ApiService.getRoomInfo(roomId!);
       setRoomInfo(info);
 
-      if (info.fileInfo) {
-        setFileInfo(info.fileInfo as FileInfo);
-      }
-
       if (info.multipleFilesInfo) {
-        setMultipleFilesInfo(info.multipleFilesInfo as MultipleFileInfo);
         if (info.multipleFilesInfo.hasPasscode) {
           setPasscodeRequired(true);
+        } else {
+          setMultipleFilesInfo(info.multipleFilesInfo as MultipleFileInfo);
         }
+      } else if (info.fileInfo) {
+        setFileInfo(info.fileInfo as FileInfo);
       }
 
       const webrtc = new WebRTCService();
@@ -80,13 +80,16 @@ export function ReceivePage() {
       webrtc.onUserLeft = (count) => setParticipantCount(count);
 
       webrtc.onFileInfoReceived = (info) => {
-        setFileInfo(info);
+        if (!passcodeRequired || passcodeValidated) {
+          setFileInfo(info);
+        }
       };
 
       webrtc.onMultipleFilesInfoReceived = (filesInfo) => {
-        setMultipleFilesInfo(filesInfo);
         if (filesInfo.hasPasscode || filesInfo.passcode) {
           setPasscodeRequired(true);
+        } else {
+          setMultipleFilesInfo(filesInfo);
         }
       };
 
@@ -96,11 +99,7 @@ export function ReceivePage() {
       };
 
       webrtc.onFileReceived = (file) => {
-        if (multipleFilesInfo || receivedFiles.length > 0) {
-          setReceivedFiles(prev => [...prev, file]);
-        } else {
-          setReceivedFile(file);
-        }
+        setReceivedFiles(prev => [...prev, file]);
         setIsReceiving(false);
       };
 
@@ -116,11 +115,16 @@ export function ReceivePage() {
       };
 
       webrtc.onPasscodeValidated = (isValid) => {
-        setPasscodeValidated(isValid);
         if (isValid) {
-          toast.success('Passcode accepted');
+          setPasscodeValidated(true);
+          setPasscodeError(false);
+          toast.success('passcode accepted');
+          if (roomInfo?.multipleFilesInfo) {
+            setMultipleFilesInfo(roomInfo.multipleFilesInfo as MultipleFileInfo);
+          }
         } else {
-          toast.error('Wrong passcode');
+          setPasscodeError(true);
+          toast.error('wrong passcode');
           setPasscode('');
         }
       };
@@ -136,7 +140,7 @@ export function ReceivePage() {
 
       await webrtc.joinRoom(roomId!, false);
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : 'Failed to load room';
+      const message = error instanceof Error ? error.message : 'failed to load room';
       setError(message);
     } finally {
       setLoading(false);
@@ -166,28 +170,32 @@ export function ReceivePage() {
 
   const handlePasscodeSubmit = () => {
     if (!webrtcRef.current || passcode.length !== 6) {
-      toast.error('Enter a 6-digit passcode');
+      toast.error('enter a 6-digit passcode');
       return;
     }
 
-    webrtcRef.current.validatePasscode(passcode);
+    setPasscodeError(false);
+    webrtcRef.current.submitPasscode(passcode);
   };
 
   const getStatusText = () => {
-    if (allFilesReceived || receivedFile) return 'Transfer complete';
-    if (isReceiving) return 'Receiving...';
+    if (allFilesReceived || (receivedFiles.length > 0 && !isReceiving && !fileTransferState)) return 'transfer complete';
+    if (receivedFile && receivedFiles.length === 0) return 'transfer complete';
+    if (isReceiving) return 'receiving...';
+    if (passcodeRequired && !passcodeValidated) return 'passcode required';
     switch (connectionState) {
-      case 'connecting': return 'Connecting to sender...';
-      case 'connected': return 'Connected';
-      case 'disconnected': return 'Disconnected';
-      case 'failed': return 'Connection failed';
-      default: return 'Waiting for connection...';
+      case 'connecting': return 'connecting to sender...';
+      case 'connected': return 'connected';
+      case 'disconnected': return 'disconnected';
+      case 'failed': return 'connection failed';
+      default: return 'waiting for connection...';
     }
   };
 
   const getStatusColor = () => {
-    if (allFilesReceived || receivedFile) return 'text-green-400';
+    if (allFilesReceived || receivedFiles.length > 0 || receivedFile) return 'text-green-400';
     if (isReceiving) return 'text-blue-400';
+    if (passcodeRequired && !passcodeValidated) return 'text-yellow-400';
     switch (connectionState) {
       case 'connected': return 'text-green-400';
       case 'connecting': return 'text-yellow-400';
@@ -195,6 +203,8 @@ export function ReceivePage() {
       default: return 'text-muted-foreground';
     }
   };
+
+  const isTransferDone = allFilesReceived || receivedFiles.length > 0 || !!receivedFile;
 
   if (loading) {
     return (
@@ -254,13 +264,13 @@ export function ReceivePage() {
                 enter passcode
               </CardTitle>
               <CardDescription className="text-sm sm:text-base px-2">
-                this transfer is passcode-protected
+                this transfer is passcode-protected. enter the code to receive files.
               </CardDescription>
             </CardHeader>
             <CardContent>
               <div className="space-y-4 sm:space-y-6">
                 <div className="flex justify-center">
-                  <InputOTP maxLength={6} value={passcode} onChange={setPasscode}>
+                  <InputOTP maxLength={6} value={passcode} onChange={(val) => { setPasscode(val); setPasscodeError(false); }}>
                     <InputOTPGroup className="gap-1 sm:gap-2">
                       <InputOTPSlot index={0} className="w-10 h-10 sm:w-12 sm:h-12 text-base sm:text-lg" />
                       <InputOTPSlot index={1} className="w-10 h-10 sm:w-12 sm:h-12 text-base sm:text-lg" />
@@ -274,19 +284,35 @@ export function ReceivePage() {
                     </InputOTPGroup>
                   </InputOTP>
                 </div>
+                {passcodeError && (
+                  <p className="text-sm text-red-400 text-center">wrong passcode. try again.</p>
+                )}
                 <Button
                   onClick={handlePasscodeSubmit}
                   disabled={passcode.length !== 6}
                   className="w-full h-12 text-base"
                 >
-                  validate
+                  submit passcode
                 </Button>
               </div>
             </CardContent>
           </Card>
         )}
 
-        {multipleFilesInfo && multipleFilesInfo.files && (
+        {passcodeRequired && !passcodeValidated && (
+          <Card>
+            <CardContent className="pt-6">
+              <div className="text-center space-y-2">
+                <Lock className="h-8 w-8 mx-auto text-muted-foreground" />
+                <p className="text-muted-foreground text-sm">
+                  file details are hidden until the passcode is entered
+                </p>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {(!passcodeRequired || passcodeValidated) && multipleFilesInfo && multipleFilesInfo.files && (
           <Card>
             <CardHeader>
               <CardTitle className="flex items-center gap-2 text-lg sm:text-xl">
@@ -310,7 +336,7 @@ export function ReceivePage() {
                     </div>
                     <div className="flex-shrink-0 ml-2">
                       {fileTransferState && index < fileTransferState.completedFiles && (
-                        <CheckCircle className="h-4 w-4 sm:h-5 sm:w-5 text-green-500" />
+                        <Download className="h-4 w-4 sm:h-5 sm:w-5 text-green-500" />
                       )}
                       {fileTransferState && index === fileTransferState.currentFileIndex && isReceiving && (
                         <Loader2 className="h-4 w-4 sm:h-5 sm:w-5 animate-spin text-blue-500" />
@@ -323,7 +349,7 @@ export function ReceivePage() {
           </Card>
         )}
 
-        {fileInfo && !multipleFilesInfo && (
+        {(!passcodeRequired || passcodeValidated) && fileInfo && !multipleFilesInfo && (
           <Card>
             <CardHeader>
               <CardTitle className="flex items-center gap-2 text-lg sm:text-xl">
@@ -374,12 +400,14 @@ export function ReceivePage() {
                 </span>
               </div>
 
-              <div className="flex items-center justify-between">
-                <span className="text-sm sm:text-base font-medium">participants:</span>
-                <span className="text-sm sm:text-base text-muted-foreground">
-                  {participantCount}/2
-                </span>
-              </div>
+              {!isTransferDone && (
+                <div className="flex items-center justify-between">
+                  <span className="text-sm sm:text-base font-medium">participants:</span>
+                  <span className="text-sm sm:text-base text-muted-foreground">
+                    {participantCount}/2
+                  </span>
+                </div>
+              )}
 
               {transferProgress && (
                 <div className="space-y-2">
@@ -413,38 +441,13 @@ export function ReceivePage() {
           </CardContent>
         </Card>
 
-        {receivedFile && receivedFiles.length === 0 && (
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-green-400">
-                <CheckCircle className="h-5 w-5" />
-                file received
-              </CardTitle>
-              <CardDescription>
-                {receivedFile.name} - {formatFileSize(receivedFile.size)}
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="flex gap-2">
-                <Button onClick={() => downloadFile(receivedFile)} className="flex-1" size="lg">
-                  <Download className="h-4 w-4 mr-2" />
-                  download
-                </Button>
-                <Button variant="outline" onClick={() => navigate('/')}>
-                  <Home className="h-4 w-4 mr-2" />
-                  home
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        )}
-
         {receivedFiles.length > 0 && (
           <Card>
             <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-green-400">
-                <CheckCircle className="h-5 w-5" />
-                {allFilesReceived ? 'all files received' : `${receivedFiles.length} files received`}
+              <CardTitle className="text-green-400">
+                {allFilesReceived
+                  ? `all ${receivedFiles.length} files received`
+                  : `${receivedFiles.length} file${receivedFiles.length > 1 ? 's' : ''} received`}
               </CardTitle>
             </CardHeader>
             <CardContent>
@@ -478,7 +481,7 @@ export function ReceivePage() {
           </Card>
         )}
 
-        {!fileInfo && !multipleFilesInfo && !error && (
+        {!passcodeRequired && !fileInfo && !multipleFilesInfo && !error && receivedFiles.length === 0 && (
           <Card>
             <CardContent className="pt-6">
               <div className="text-center space-y-4">

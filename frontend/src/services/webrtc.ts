@@ -45,6 +45,10 @@ export class WebRTCService {
   private hasCreatedOffer = false;
   private cancelled = false;
 
+  private senderPasscode: string | null = null;
+  private senderFiles: File[] | null = null;
+  private passcodeGateActive = false;
+
   public onConnectionStateChange?: (state: RTCPeerConnectionState) => void;
   public onDataChannelOpen?: () => void;
   public onDataChannelClose?: () => void;
@@ -59,6 +63,8 @@ export class WebRTCService {
   public onPasscodeRequired?: () => void;
   public onPasscodeValidated?: (isValid: boolean) => void;
   public onFileTransferStateChanged?: (state: FileTransferState) => void;
+  public onWaitingForPasscode?: () => void;
+  public onPasscodeAccepted?: () => void;
 
   constructor() {
     this.socket = io(SIGNALING_URL);
@@ -71,6 +77,12 @@ export class WebRTCService {
 
     this.setupSocketListeners();
     this.setupPeerConnectionListeners();
+  }
+
+  setSenderPasscode(passcode: string, files: File[]) {
+    this.senderPasscode = passcode;
+    this.senderFiles = files;
+    this.passcodeGateActive = true;
   }
 
   private setupSocketListeners() {
@@ -171,7 +183,7 @@ export class WebRTCService {
     };
 
     channel.onerror = () => {
-      this.onError?.('Data channel error');
+      this.onError?.('data channel error');
     };
   }
 
@@ -189,12 +201,23 @@ export class WebRTCService {
   private totalTransferred = 0;
   private isReceivingMultiple = false;
   private expectedTotalFiles = 0;
-  private passcode: string | null = null;
   private isPasscodeValidated = false;
 
   private handleDataChannelMessage(data: any) {
     if (typeof data === 'string') {
       const message = JSON.parse(data);
+
+      if (message.type === 'passcode-submit') {
+        this.handlePasscodeSubmitFromReceiver(message.passcode);
+        return;
+      }
+
+      if (message.type === 'passcode-result') {
+        const isValid = message.valid;
+        this.isPasscodeValidated = isValid;
+        this.onPasscodeValidated?.(isValid);
+        return;
+      }
 
       if (message.type === 'file-start') {
         this.receivedSize = 0;
@@ -226,14 +249,6 @@ export class WebRTCService {
         } else {
           this.reconstructFile();
         }
-      } else if (message.type === 'multiple-files-info') {
-        this.multipleFilesInfo = message.filesInfo;
-        this.expectedTotalFiles = message.filesInfo.files.length;
-        this.onMultipleFilesInfoReceived?.(message.filesInfo);
-        if (message.filesInfo.passcode) {
-          this.passcode = message.filesInfo.passcode;
-          this.onPasscodeRequired?.();
-        }
       } else if (message.type === 'all-files-complete') {
         this.onAllFilesReceived?.(this.completedFiles);
       }
@@ -255,6 +270,39 @@ export class WebRTCService {
       };
 
       this.onTransferProgress?.(progress);
+    }
+  }
+
+  private handlePasscodeSubmitFromReceiver(submittedPasscode: string) {
+    if (!this.senderPasscode) return;
+
+    const isValid = submittedPasscode === this.senderPasscode;
+
+    if (this.dataChannel?.readyState === 'open') {
+      this.dataChannel.send(JSON.stringify({
+        type: 'passcode-result',
+        valid: isValid,
+      }));
+    }
+
+    if (isValid) {
+      this.onPasscodeAccepted?.();
+      if (this.senderFiles) {
+        if (this.senderFiles.length === 1) {
+          this.sendFile(this.senderFiles[0]);
+        } else {
+          this.sendMultipleFiles(this.senderFiles);
+        }
+      }
+    }
+  }
+
+  submitPasscode(passcode: string) {
+    if (this.dataChannel?.readyState === 'open') {
+      this.dataChannel.send(JSON.stringify({
+        type: 'passcode-submit',
+        passcode,
+      }));
     }
   }
 
@@ -307,7 +355,7 @@ export class WebRTCService {
       try {
         await this.fileWriter.write(new Uint8Array(data));
       } catch {
-        this.onError?.('Failed to write file chunk');
+        this.onError?.('failed to write file chunk');
       }
     }
   }
@@ -318,14 +366,14 @@ export class WebRTCService {
         await this.fileWriter.close();
         this.fileWriter = null;
       } catch {
-        this.onError?.('Failed to finalize file download');
+        this.onError?.('failed to finalize file download');
       }
     }
   }
 
   private async waitForDataChannel(): Promise<boolean> {
     if (!this.dataChannel) {
-      this.onError?.('Data channel not created');
+      this.onError?.('data channel not created');
       return false;
     }
 
@@ -387,7 +435,7 @@ export class WebRTCService {
       }
     } catch (error) {
       this.isNegotiating = false;
-      this.onError?.(`Failed to create connection: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      this.onError?.(`failed to create connection: ${error instanceof Error ? error.message : 'unknown error'}`);
     }
   }
 
@@ -407,7 +455,7 @@ export class WebRTCService {
         });
       }
     } catch {
-      this.onError?.('Failed to handle connection offer');
+      this.onError?.('failed to handle connection offer');
     }
   }
 
@@ -421,7 +469,7 @@ export class WebRTCService {
       this.isNegotiating = false;
     } catch (error) {
       this.isNegotiating = false;
-      this.onError?.(`Connection failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      this.onError?.(`connection failed: ${error instanceof Error ? error.message : 'unknown error'}`);
     }
   }
 
@@ -431,7 +479,7 @@ export class WebRTCService {
         await this.peerConnection.addIceCandidate(candidate);
       }
     } catch {
-      // ICE candidate errors are non-fatal
+      // non-fatal
     }
   }
 
@@ -439,7 +487,7 @@ export class WebRTCService {
     const isReady = await this.waitForDataChannel();
     if (!isReady || !this.dataChannel || this.cancelled) {
       if (!this.cancelled) {
-        this.onError?.('Data channel failed to open');
+        this.onError?.('data channel failed to open');
       }
       return;
     }
@@ -463,7 +511,7 @@ export class WebRTCService {
     const sendNextChunk = (): Promise<void> => {
       return new Promise((resolve, reject) => {
         if (this.cancelled) {
-          reject(new Error('Transfer cancelled'));
+          reject(new Error('transfer cancelled'));
           return;
         }
 
@@ -478,7 +526,7 @@ export class WebRTCService {
 
         reader.onload = (event) => {
           if (!event.target?.result || !this.dataChannel) {
-            reject(new Error('Read error'));
+            reject(new Error('read error'));
             return;
           }
 
@@ -486,7 +534,7 @@ export class WebRTCService {
 
           const trySend = () => {
             if (this.cancelled) {
-              reject(new Error('Transfer cancelled'));
+              reject(new Error('transfer cancelled'));
               return;
             }
 
@@ -514,14 +562,14 @@ export class WebRTCService {
 
               sendNextChunk().then(resolve).catch(reject);
             } catch {
-              reject(new Error('Failed to send data'));
+              reject(new Error('failed to send data'));
             }
           };
 
           trySend();
         };
 
-        reader.onerror = () => reject(new Error('Failed to read file'));
+        reader.onerror = () => reject(new Error('failed to read file'));
         reader.readAsArrayBuffer(chunk);
       });
     };
@@ -530,7 +578,7 @@ export class WebRTCService {
       await sendNextChunk();
     } catch (error) {
       if (!this.cancelled) {
-        this.onError?.(error instanceof Error ? error.message : 'Transfer failed');
+        this.onError?.(error instanceof Error ? error.message : 'transfer failed');
       }
     }
   }
@@ -554,23 +602,10 @@ export class WebRTCService {
     }
   }
 
-  validatePasscode(inputPasscode: string): boolean {
-    if (!this.multipleFilesInfo?.passcode) {
-      this.isPasscodeValidated = true;
-      this.onPasscodeValidated?.(true);
-      return true;
-    }
-
-    const isValid = inputPasscode === this.multipleFilesInfo.passcode;
-    this.isPasscodeValidated = isValid;
-    this.onPasscodeValidated?.(isValid);
-    return isValid;
-  }
-
   async sendMultipleFiles(files: File[]) {
     const isReady = await this.waitForDataChannel();
     if (!isReady || !this.dataChannel) {
-      this.onError?.('Data channel not ready');
+      this.onError?.('data channel not ready');
       return;
     }
 
@@ -614,11 +649,13 @@ export class WebRTCService {
     this.currentFileIndex = 0;
     this.completedFiles = [];
     this.totalTransferred = 0;
-    this.passcode = null;
     this.isPasscodeValidated = false;
     this.isReceivingMultiple = false;
     this.expectedTotalFiles = 0;
     this.cancelled = false;
+    this.senderPasscode = null;
+    this.senderFiles = null;
+    this.passcodeGateActive = false;
 
     if (this.fileWriter) {
       this.fileWriter.close().catch(() => {});

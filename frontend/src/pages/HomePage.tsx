@@ -24,6 +24,7 @@ export function HomePage() {
   const [passcode, setPasscode] = useState('');
   const [isDragging, setIsDragging] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [waitingForPasscode, setWaitingForPasscode] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const webrtcRef = useRef<WebRTCService | null>(null);
   const roomIdRef = useRef<string | null>(null);
@@ -72,7 +73,7 @@ export function HomePage() {
   const createShareLink = async () => {
     if (selectedFiles.length === 0) return;
     if (usePasscode && passcode.length !== 6) {
-      toast.error('Please enter a 6-digit passcode');
+      toast.error('please enter a 6-digit passcode');
       return;
     }
 
@@ -85,16 +86,31 @@ export function HomePage() {
       const webrtc = new WebRTCService();
       webrtcRef.current = webrtc;
 
+      const hasPasscode = usePasscode && passcode.length === 6;
+
+      if (hasPasscode) {
+        webrtc.setSenderPasscode(passcode, selectedFiles);
+      }
+
       webrtc.onConnectionStateChange = (state) => {
         setConnectionState(state);
         if (state === 'connected') {
-          setIsTransferring(true);
-          if (selectedFiles.length === 1 && !usePasscode) {
-            webrtc.sendFile(selectedFiles[0]);
+          if (hasPasscode) {
+            setWaitingForPasscode(true);
           } else {
-            webrtc.sendMultipleFiles(selectedFiles);
+            setIsTransferring(true);
+            if (selectedFiles.length === 1) {
+              webrtc.sendFile(selectedFiles[0]);
+            } else {
+              webrtc.sendMultipleFiles(selectedFiles);
+            }
           }
         }
+      };
+
+      webrtc.onPasscodeAccepted = () => {
+        setWaitingForPasscode(false);
+        setIsTransferring(true);
       };
 
       webrtc.onUserJoined = (count) => setParticipantCount(count);
@@ -105,7 +121,7 @@ export function HomePage() {
         if (progress.percentage >= 100 && selectedFiles.length === 1) {
           setIsTransferring(false);
           setTransferComplete(true);
-          toast.success('Transfer complete');
+          toast.success('transfer complete');
         }
       };
 
@@ -113,7 +129,7 @@ export function HomePage() {
         if (state.completedFiles === state.totalFiles) {
           setIsTransferring(false);
           setTransferComplete(true);
-          toast.success(`All ${state.totalFiles} files transferred`);
+          toast.success(`all ${state.totalFiles} files transferred`);
         }
       };
 
@@ -123,28 +139,19 @@ export function HomePage() {
 
       await webrtc.joinRoom(roomId, true);
 
-      if (selectedFiles.length === 1 && !usePasscode) {
-        const fileInfo: FileInfo = {
-          name: selectedFiles[0].name,
-          size: selectedFiles[0].size,
-          type: selectedFiles[0].type,
-        };
-        webrtc.setFileInfo(fileInfo);
-      } else {
-        const multipleFileInfo: MultipleFileInfo = {
-          files: selectedFiles.map((file, index) => ({
-            id: `file-${index}`,
-            name: file.name,
-            size: file.size,
-            type: file.type,
-          })),
-          totalSize: getTotalSize(),
-          passcode: usePasscode ? passcode : undefined,
-        };
-        webrtc.setMultipleFilesInfo(multipleFileInfo);
-      }
+      const multipleFileInfo: MultipleFileInfo = {
+        files: selectedFiles.map((file, index) => ({
+          id: `file-${index}`,
+          name: file.name,
+          size: file.size,
+          type: file.type,
+        })),
+        totalSize: getTotalSize(),
+        passcode: hasPasscode ? passcode : undefined,
+      };
+      webrtc.setMultipleFilesInfo(multipleFileInfo);
     } catch (error) {
-      toast.error('Failed to create share link. Is the server running?');
+      toast.error('failed to create share link. is the server running?');
     } finally {
       setIsCreatingRoom(false);
     }
@@ -154,10 +161,10 @@ export function HomePage() {
     try {
       await navigator.clipboard.writeText(shareUrl);
       setCopied(true);
-      toast.success('Link copied');
+      toast.success('link copied');
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      toast.error('Failed to copy. Please select and copy manually.');
+      toast.error('failed to copy. select and copy manually.');
     }
   };
 
@@ -166,7 +173,7 @@ export function HomePage() {
       webrtcRef.current.cancelTransfer();
     }
     setIsTransferring(false);
-    toast('Transfer cancelled');
+    toast('transfer cancelled');
   };
 
   const resetForm = () => {
@@ -180,6 +187,7 @@ export function HomePage() {
     setUsePasscode(false);
     setPasscode('');
     setCopied(false);
+    setWaitingForPasscode(false);
     if (webrtcRef.current) {
       webrtcRef.current.disconnect();
       webrtcRef.current = null;
@@ -190,19 +198,21 @@ export function HomePage() {
   };
 
   const getStatusText = () => {
-    if (transferComplete) return 'Transfer complete';
-    if (isTransferring) return 'Transferring...';
+    if (transferComplete) return 'transfer complete';
+    if (waitingForPasscode) return 'waiting for recipient passcode...';
+    if (isTransferring) return 'transferring...';
     switch (connectionState) {
-      case 'connecting': return 'Connecting to recipient...';
-      case 'connected': return 'Connected - transferring';
-      case 'disconnected': return 'Disconnected';
-      case 'failed': return 'Connection failed';
-      default: return 'Waiting for recipient...';
+      case 'connecting': return 'connecting to recipient...';
+      case 'connected': return 'connected - transferring';
+      case 'disconnected': return 'disconnected';
+      case 'failed': return 'connection failed';
+      default: return 'waiting for recipient...';
     }
   };
 
   const getStatusColor = () => {
     if (transferComplete) return 'text-green-400';
+    if (waitingForPasscode) return 'text-yellow-400';
     if (isTransferring) return 'text-blue-400';
     switch (connectionState) {
       case 'connected': return 'text-green-400';
