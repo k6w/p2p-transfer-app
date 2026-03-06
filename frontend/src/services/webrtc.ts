@@ -1,5 +1,7 @@
 import { io, Socket } from 'socket.io-client';
 
+const SIGNALING_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+
 export interface FileInfo {
   name: string;
   size: number;
@@ -11,6 +13,7 @@ export interface MultipleFileInfo {
   files: FileInfo[];
   totalSize: number;
   passcode?: string;
+  hasPasscode?: boolean;
 }
 
 export interface TransferProgress {
@@ -23,9 +26,14 @@ export interface TransferProgress {
 
 export interface FileTransferState {
   currentFileIndex: number;
-  completedFiles: File[];
+  completedFiles: number;
   totalFiles: number;
 }
+
+const CHUNK_SIZE = 16384;
+const BUFFER_THRESHOLD = 16 * 1024 * 1024;
+const LARGE_FILE_THRESHOLD = 100 * 1024 * 1024;
+const DATA_CHANNEL_TIMEOUT = 15000;
 
 export class WebRTCService {
   private socket: Socket;
@@ -35,8 +43,8 @@ export class WebRTCService {
   private isInitiator = false;
   private isNegotiating = false;
   private hasCreatedOffer = false;
-  
-  // Callbacks
+  private cancelled = false;
+
   public onConnectionStateChange?: (state: RTCPeerConnectionState) => void;
   public onDataChannelOpen?: () => void;
   public onDataChannelClose?: () => void;
@@ -53,7 +61,7 @@ export class WebRTCService {
   public onFileTransferStateChanged?: (state: FileTransferState) => void;
 
   constructor() {
-    this.socket = io('http://localhost:3001');
+    this.socket = io(SIGNALING_URL);
     this.peerConnection = new RTCPeerConnection({
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -66,18 +74,23 @@ export class WebRTCService {
   }
 
   private setupSocketListeners() {
-    this.socket.on('room-joined', ({ participantCount, fileInfo }) => {
-      if (fileInfo) {
+    this.socket.on('room-joined', ({ participantCount, fileInfo, multipleFilesInfo }) => {
+      if (multipleFilesInfo) {
+        this.multipleFilesInfo = multipleFilesInfo;
+        this.onMultipleFilesInfoReceived?.(multipleFilesInfo);
+        if (multipleFilesInfo.hasPasscode) {
+          this.onPasscodeRequired?.();
+        }
+      } else if (fileInfo) {
         this.onFileInfoReceived?.(fileInfo);
       }
     });
 
     this.socket.on('user-joined', ({ participantCount }) => {
       this.onUserJoined?.(participantCount);
-      
-      // If we're the initiator and exactly 2 participants (us + 1 receiver), create an offer
-      if (this.isInitiator && participantCount === 2 && 
-          this.peerConnection.signalingState === 'stable' && 
+
+      if (this.isInitiator && participantCount === 2 &&
+          this.peerConnection.signalingState === 'stable' &&
           !this.hasCreatedOffer && !this.isNegotiating) {
         this.createOffer();
       }
@@ -89,6 +102,14 @@ export class WebRTCService {
 
     this.socket.on('file-info-updated', (fileInfo: FileInfo) => {
       this.onFileInfoReceived?.(fileInfo);
+    });
+
+    this.socket.on('multiple-files-info-updated', (filesInfo: MultipleFileInfo) => {
+      this.multipleFilesInfo = filesInfo;
+      this.onMultipleFilesInfoReceived?.(filesInfo);
+      if (filesInfo.hasPasscode) {
+        this.onPasscodeRequired?.();
+      }
     });
 
     this.socket.on('offer', async ({ offer }) => {
@@ -104,34 +125,19 @@ export class WebRTCService {
     });
 
     this.socket.on('error', (error: string) => {
-       this.onError?.(error);
-     });
+      this.onError?.(error);
+    });
   }
 
   private setupPeerConnectionListeners() {
     this.peerConnection.onconnectionstatechange = () => {
-      console.log(`Peer connection state changed to: ${this.peerConnection.connectionState}`);
-      
-      // Reset negotiation state on connection failure or close
-      if (this.peerConnection.connectionState === 'failed' || 
+      if (this.peerConnection.connectionState === 'failed' ||
           this.peerConnection.connectionState === 'closed' ||
           this.peerConnection.connectionState === 'disconnected') {
         this.resetConnectionState();
       }
-      
+
       this.onConnectionStateChange?.(this.peerConnection.connectionState);
-    };
-    
-    this.peerConnection.onsignalingstatechange = () => {
-      console.log(`Signaling state changed to: ${this.peerConnection.signalingState}`);
-    };
-    
-    this.peerConnection.onicegatheringstatechange = () => {
-      console.log(`ICE gathering state changed to: ${this.peerConnection.iceGatheringState}`);
-    };
-    
-    this.peerConnection.oniceconnectionstatechange = () => {
-      console.log(`ICE connection state changed to: ${this.peerConnection.iceConnectionState}`);
     };
 
     this.peerConnection.onicecandidate = (event) => {
@@ -150,32 +156,22 @@ export class WebRTCService {
 
   private setupDataChannel(channel: RTCDataChannel) {
     this.dataChannel = channel;
-    
-    // Configure buffer settings for better flow control
-    channel.bufferedAmountLowThreshold = 8 * 1024 * 1024; // 8MB threshold
-    
+    channel.bufferedAmountLowThreshold = 8 * 1024 * 1024;
+
     channel.onopen = () => {
-      console.log('Data channel opened successfully');
       this.onDataChannelOpen?.();
     };
-    
+
     channel.onclose = () => {
-      console.log('Data channel closed');
       this.onDataChannelClose?.();
     };
-    
+
     channel.onmessage = (event) => {
       this.handleDataChannelMessage(event.data);
     };
-    
-    channel.onerror = (error) => {
-      console.error('Data channel error:', error);
-      this.onError?.(`Data channel error: ${error}`);
-    };
-    
-    channel.onbufferedamountlow = () => {
-      // Buffer is ready for more data
-      console.log('Data channel buffer ready for more data');
+
+    channel.onerror = () => {
+      this.onError?.('Data channel error');
     };
   }
 
@@ -185,60 +181,79 @@ export class WebRTCService {
   private expectedFileName = '';
   private expectedFileType = '';
   private fileWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
-  private downloadStream: ReadableStream<Uint8Array> | null = null;
   private isLargeFile = false;
-  private readonly LARGE_FILE_THRESHOLD = 100 * 1024 * 1024; // 100MB threshold for streaming
-  
-  // Multiple files support
+
   private multipleFilesInfo: MultipleFileInfo | null = null;
   private currentFileIndex = 0;
   private completedFiles: File[] = [];
   private totalTransferred = 0;
+  private isReceivingMultiple = false;
+  private expectedTotalFiles = 0;
   private passcode: string | null = null;
   private isPasscodeValidated = false;
 
   private handleDataChannelMessage(data: any) {
     if (typeof data === 'string') {
-      // Control message
       const message = JSON.parse(data);
-      
+
       if (message.type === 'file-start') {
         this.receivedSize = 0;
         this.expectedFileSize = message.size;
         this.expectedFileName = message.name;
         this.expectedFileType = message.fileType;
-        this.isLargeFile = message.size > this.LARGE_FILE_THRESHOLD;
-        
+        this.isLargeFile = message.size > LARGE_FILE_THRESHOLD;
+
+        if (message.fileIndex !== undefined) {
+          this.isReceivingMultiple = true;
+          this.currentFileIndex = message.fileIndex;
+          this.expectedTotalFiles = message.totalFiles || this.expectedTotalFiles;
+        }
+
         if (this.isLargeFile) {
-          // Use streaming for large files
           this.initializeStreamingDownload();
         } else {
-          // Use in-memory chunks for smaller files
           this.receivedChunks = [];
         }
+
+        this.onFileTransferStateChanged?.({
+          currentFileIndex: this.currentFileIndex,
+          completedFiles: this.completedFiles.length,
+          totalFiles: this.expectedTotalFiles,
+        });
       } else if (message.type === 'file-end') {
         if (this.isLargeFile) {
           this.finalizeStreamingDownload();
         } else {
           this.reconstructFile();
         }
+      } else if (message.type === 'multiple-files-info') {
+        this.multipleFilesInfo = message.filesInfo;
+        this.expectedTotalFiles = message.filesInfo.files.length;
+        this.onMultipleFilesInfoReceived?.(message.filesInfo);
+        if (message.filesInfo.passcode) {
+          this.passcode = message.filesInfo.passcode;
+          this.onPasscodeRequired?.();
+        }
+      } else if (message.type === 'all-files-complete') {
+        this.onAllFilesReceived?.(this.completedFiles);
       }
     } else {
-      // File chunk
       if (this.isLargeFile) {
         this.writeStreamChunk(data);
       } else {
         this.receivedChunks.push(data);
       }
-      
+
       this.receivedSize += data.byteLength;
-      
+
       const progress: TransferProgress = {
         transferred: this.receivedSize,
         total: this.expectedFileSize,
         percentage: (this.receivedSize / this.expectedFileSize) * 100,
+        currentFileIndex: this.isReceivingMultiple ? this.currentFileIndex : undefined,
+        currentFileName: this.expectedFileName,
       };
-      
+
       this.onTransferProgress?.(progress);
     }
   }
@@ -246,33 +261,40 @@ export class WebRTCService {
   private reconstructFile() {
     const blob = new Blob(this.receivedChunks, { type: this.expectedFileType });
     const file = new File([blob], this.expectedFileName, { type: this.expectedFileType });
+
+    if (this.isReceivingMultiple) {
+      this.completedFiles.push(file);
+      this.onFileTransferStateChanged?.({
+        currentFileIndex: this.currentFileIndex,
+        completedFiles: this.completedFiles.length,
+        totalFiles: this.expectedTotalFiles,
+      });
+    }
+
     this.onFileReceived?.(file);
+    this.receivedChunks = [];
   }
 
   private initializeStreamingDownload() {
     const chunks: Uint8Array[] = [];
-    
-    this.downloadStream = new ReadableStream({
-      start(controller) {
-        // Stream will be populated as chunks arrive
-      },
-      pull(controller) {
-        // Handle backpressure if needed
-      },
-      cancel() {
-        // Stream cancelled
-      }
-    });
 
-    // Create a writable stream to collect chunks
     const writableStream = new WritableStream({
       write: (chunk: Uint8Array) => {
         chunks.push(chunk);
       },
       close: () => {
-        // Create blob from all chunks when complete
         const blob = new Blob(chunks, { type: this.expectedFileType });
         const file = new File([blob], this.expectedFileName, { type: this.expectedFileType });
+
+        if (this.isReceivingMultiple) {
+          this.completedFiles.push(file);
+          this.onFileTransferStateChanged?.({
+            currentFileIndex: this.currentFileIndex,
+            completedFiles: this.completedFiles.length,
+            totalFiles: this.expectedTotalFiles,
+          });
+        }
+
         this.onFileReceived?.(file);
       }
     });
@@ -284,9 +306,9 @@ export class WebRTCService {
     if (this.fileWriter) {
       try {
         await this.fileWriter.write(new Uint8Array(data));
-      } catch (error) {
-          this.onError?.('Failed to write file chunk');
-        }
+      } catch {
+        this.onError?.('Failed to write file chunk');
+      }
     }
   }
 
@@ -295,244 +317,222 @@ export class WebRTCService {
       try {
         await this.fileWriter.close();
         this.fileWriter = null;
-        this.downloadStream = null;
-      } catch (error) {
-          this.onError?.('Failed to finalize file download');
-        }
+      } catch {
+        this.onError?.('Failed to finalize file download');
+      }
     }
+  }
+
+  private async waitForDataChannel(): Promise<boolean> {
+    if (!this.dataChannel) {
+      this.onError?.('Data channel not created');
+      return false;
+    }
+
+    if (this.dataChannel.readyState === 'open') {
+      return true;
+    }
+
+    return new Promise<boolean>((resolve) => {
+      const timeout = setTimeout(() => resolve(false), DATA_CHANNEL_TIMEOUT);
+
+      const onOpen = () => {
+        clearTimeout(timeout);
+        this.dataChannel?.removeEventListener('open', onOpen);
+        resolve(true);
+      };
+
+      this.dataChannel?.addEventListener('open', onOpen);
+    });
   }
 
   async joinRoom(roomId: string, asInitiator = false) {
     this.roomId = roomId;
     this.isInitiator = asInitiator;
-    
+
     if (asInitiator) {
-      // Create data channel for the initiator with optimized settings
       this.dataChannel = this.peerConnection.createDataChannel('fileTransfer', {
         ordered: true,
         maxRetransmits: 3,
       });
       this.setupDataChannel(this.dataChannel);
     }
-    
+
     this.socket.emit('join-room', roomId);
   }
 
   async createOffer() {
     try {
-      if (this.isNegotiating || this.hasCreatedOffer) {
-        console.log('Already negotiating or offer created, skipping');
-        return;
-      }
-      
+      if (this.isNegotiating || this.hasCreatedOffer) return;
+
       this.isNegotiating = true;
-      console.log('Creating WebRTC offer as initiator');
-      
-      // Create data channel before creating offer (initiator must create the data channel)
+
       if (!this.dataChannel) {
-        console.log('Creating data channel for file transfer');
         const channel = this.peerConnection.createDataChannel('fileTransfer', {
           ordered: true,
           maxRetransmits: 3
         });
         this.setupDataChannel(channel);
       }
-      
+
       const offer = await this.peerConnection.createOffer();
       await this.peerConnection.setLocalDescription(offer);
       this.hasCreatedOffer = true;
-      console.log('Created and set local offer description');
-      
+
       if (this.roomId) {
         this.socket.emit('offer', {
           roomId: this.roomId,
           offer: offer,
         });
-        console.log('Sent offer to room:', this.roomId);
       }
     } catch (error) {
-      console.error('Error creating offer:', error);
       this.isNegotiating = false;
-      this.onError?.(`Failed to create offer: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      this.onError?.(`Failed to create connection: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
   async handleOffer(offer: RTCSessionDescriptionInit) {
     try {
-      // Only handle offer if we are not the initiator and in the right state
-      if (this.isInitiator) {
-        return;
-      }
-      
-      if (this.peerConnection.signalingState !== 'stable') {
-        return;
-      }
-      
+      if (this.isInitiator) return;
+      if (this.peerConnection.signalingState !== 'stable') return;
+
       await this.peerConnection.setRemoteDescription(offer);
       const answer = await this.peerConnection.createAnswer();
       await this.peerConnection.setLocalDescription(answer);
-      
+
       if (this.roomId) {
         this.socket.emit('answer', {
           roomId: this.roomId,
           answer: answer,
         });
       }
-    } catch (error) {
-        this.onError?.('Failed to handle offer');
-      }
+    } catch {
+      this.onError?.('Failed to handle connection offer');
+    }
   }
 
   async handleAnswer(answer: RTCSessionDescriptionInit) {
     try {
-      // Only handle answer if we are the initiator and in the right state
-      if (!this.isInitiator) {
-        console.warn('Received answer but not initiator, ignoring');
-        return;
-      }
-      
-      if (this.peerConnection.signalingState !== 'have-local-offer') {
-        console.warn(`Cannot handle answer in signaling state: ${this.peerConnection.signalingState}`);
-        return;
-      }
-      
-      if (!this.isNegotiating) {
-        console.warn('Received answer but not currently negotiating, ignoring');
-        return;
-      }
-      
+      if (!this.isInitiator) return;
+      if (this.peerConnection.signalingState !== 'have-local-offer') return;
+      if (!this.isNegotiating) return;
+
       await this.peerConnection.setRemoteDescription(answer);
       this.isNegotiating = false;
-      console.log('Successfully set remote description from answer');
     } catch (error) {
-      console.error('Error handling answer:', error);
       this.isNegotiating = false;
-      this.onError?.(`Failed to handle answer: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      this.onError?.(`Connection failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
   async handleIceCandidate(candidate: RTCIceCandidateInit) {
     try {
-      // Only add ICE candidates if we have a remote description
       if (this.peerConnection.remoteDescription) {
         await this.peerConnection.addIceCandidate(candidate);
       }
-    } catch (error) {
-        // Ignore ICE candidate errors
-      }
+    } catch {
+      // ICE candidate errors are non-fatal
+    }
   }
 
-  async sendFile(file: File) {
-    if (!this.dataChannel) {
-      this.onError?.('Data channel not created');
+  async sendFile(file: File, fileIndex?: number, totalFiles?: number) {
+    const isReady = await this.waitForDataChannel();
+    if (!isReady || !this.dataChannel || this.cancelled) {
+      if (!this.cancelled) {
+        this.onError?.('Data channel failed to open');
+      }
       return;
     }
-    
-    // Wait for data channel to be open (with timeout)
-    if (this.dataChannel.readyState !== 'open') {
-      console.log(`Data channel state: ${this.dataChannel.readyState}, waiting for open state...`);
-      
-      const waitForOpen = new Promise<boolean>((resolve) => {
-        const timeout = setTimeout(() => resolve(false), 10000); // 10 second timeout
-        
-        if (this.dataChannel?.readyState === 'open') {
-          clearTimeout(timeout);
-          resolve(true);
-          return;
-        }
-        
-        const onOpen = () => {
-          clearTimeout(timeout);
-          this.dataChannel?.removeEventListener('open', onOpen);
-          resolve(true);
-        };
-        
-        this.dataChannel?.addEventListener('open', onOpen);
-      });
-      
-      const isOpen = await waitForOpen;
-      if (!isOpen) {
-        this.onError?.(`Data channel failed to open within timeout. Current state: ${this.dataChannel.readyState}`);
-        return;
-      }
-    }
 
-    const chunkSize = 16384; // 16KB chunks (reduced from 64KB) to prevent buffer overflow
-    const fileReader = new FileReader();
     let offset = 0;
 
-    // Send file metadata
-    const startMessage = {
+    const startMessage: Record<string, any> = {
       type: 'file-start',
       name: file.name,
       size: file.size,
       fileType: file.type,
     };
-    
+
+    if (fileIndex !== undefined) {
+      startMessage.fileIndex = fileIndex;
+      startMessage.totalFiles = totalFiles;
+    }
+
     this.dataChannel.send(JSON.stringify(startMessage));
 
-    const sendChunk = () => {
-      const chunk = file.slice(offset, offset + chunkSize);
-      fileReader.readAsArrayBuffer(chunk);
-    };
+    const sendNextChunk = (): Promise<void> => {
+      return new Promise((resolve, reject) => {
+        if (this.cancelled) {
+          reject(new Error('Transfer cancelled'));
+          return;
+        }
 
-    const processSendProgress = () => {
-      offset += chunkSize;
-      
-      const progress: TransferProgress = {
-        transferred: offset,
-        total: file.size,
-        percentage: Math.min((offset / file.size) * 100, 100),
-      };
-      
-      this.onTransferProgress?.(progress);
+        if (offset >= file.size) {
+          this.dataChannel?.send(JSON.stringify({ type: 'file-end' }));
+          resolve();
+          return;
+        }
 
-      if (offset < file.size) {
-        sendChunk();
-      } else {
-        // Send end message
-        const endMessage = { type: 'file-end' };
-        this.dataChannel?.send(JSON.stringify(endMessage));
-      }
-    };
+        const chunk = file.slice(offset, offset + CHUNK_SIZE);
+        const reader = new FileReader();
 
-    fileReader.onload = (event) => {
-      if (event.target?.result && this.dataChannel) {
-        const data = event.target.result as ArrayBuffer;
-        
-        // Check data channel buffer to prevent overwhelming it
-        const bufferThreshold = 16 * 1024 * 1024; // 16MB buffer limit
-        
-        if (this.dataChannel.bufferedAmount > bufferThreshold) {
-          // Set up bufferedamountlow event to wait for buffer to drain
-          const lowThreshold = bufferThreshold / 2; // 8MB
-          this.dataChannel.bufferedAmountLowThreshold = lowThreshold;
-          
-          const onBufferLow = () => {
-            if (this.dataChannel) {
-              this.dataChannel.removeEventListener('bufferedamountlow', onBufferLow);
-              try {
-                this.dataChannel.send(data);
-                processSendProgress();
-              } catch (error) {
-                  this.onError?.('Failed to send file data');
-                }
+        reader.onload = (event) => {
+          if (!event.target?.result || !this.dataChannel) {
+            reject(new Error('Read error'));
+            return;
+          }
+
+          const data = event.target.result as ArrayBuffer;
+
+          const trySend = () => {
+            if (this.cancelled) {
+              reject(new Error('Transfer cancelled'));
+              return;
+            }
+
+            try {
+              if (this.dataChannel!.bufferedAmount > BUFFER_THRESHOLD) {
+                this.dataChannel!.bufferedAmountLowThreshold = BUFFER_THRESHOLD / 2;
+                const onLow = () => {
+                  this.dataChannel?.removeEventListener('bufferedamountlow', onLow);
+                  trySend();
+                };
+                this.dataChannel!.addEventListener('bufferedamountlow', onLow);
+                return;
+              }
+
+              this.dataChannel!.send(data);
+              offset += data.byteLength;
+
+              this.onTransferProgress?.({
+                transferred: Math.min(offset, file.size),
+                total: file.size,
+                percentage: Math.min((offset / file.size) * 100, 100),
+                currentFileIndex: fileIndex,
+                currentFileName: file.name,
+              });
+
+              sendNextChunk().then(resolve).catch(reject);
+            } catch {
+              reject(new Error('Failed to send data'));
             }
           };
-          
-          this.dataChannel.addEventListener('bufferedamountlow', onBufferLow);
-        } else {
-          try {
-            this.dataChannel.send(data);
-            processSendProgress();
-          } catch (error) {
-            this.onError?.('Failed to send file data');
-          }
-        }
-      }
+
+          trySend();
+        };
+
+        reader.onerror = () => reject(new Error('Failed to read file'));
+        reader.readAsArrayBuffer(chunk);
+      });
     };
 
-    sendChunk();
+    try {
+      await sendNextChunk();
+    } catch (error) {
+      if (!this.cancelled) {
+        this.onError?.(error instanceof Error ? error.message : 'Transfer failed');
+      }
+    }
   }
 
   setFileInfo(fileInfo: FileInfo) {
@@ -554,61 +554,57 @@ export class WebRTCService {
     }
   }
 
-  validatePasscode(passcode: string): boolean {
+  validatePasscode(inputPasscode: string): boolean {
     if (!this.multipleFilesInfo?.passcode) {
       this.isPasscodeValidated = true;
+      this.onPasscodeValidated?.(true);
       return true;
     }
-    
-    const isValid = passcode === this.multipleFilesInfo.passcode;
+
+    const isValid = inputPasscode === this.multipleFilesInfo.passcode;
     this.isPasscodeValidated = isValid;
     this.onPasscodeValidated?.(isValid);
     return isValid;
   }
 
-  async sendMultipleFiles(files: File[], passcode?: string) {
-    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+  async sendMultipleFiles(files: File[]) {
+    const isReady = await this.waitForDataChannel();
+    if (!isReady || !this.dataChannel) {
       this.onError?.('Data channel not ready');
       return;
     }
 
-    const filesInfo: MultipleFileInfo = {
-      files: files.map((file, index) => ({
-        name: file.name,
-        size: file.size,
-        type: file.type,
-        id: `file-${index}`,
-      })),
-      totalSize: files.reduce((total, file) => total + file.size, 0),
-      passcode,
-    };
-
-    this.setMultipleFilesInfo(filesInfo);
-
-    // Send files sequentially
     for (let i = 0; i < files.length; i++) {
+      if (this.cancelled) break;
+
       this.currentFileIndex = i;
-      await this.sendFile(files[i]);
-      
-      // Update transfer state
       this.onFileTransferStateChanged?.({
         currentFileIndex: i,
-        completedFiles: this.completedFiles,
+        completedFiles: i,
         totalFiles: files.length,
       });
+
+      await this.sendFile(files[i], i, files.length);
     }
+
+    if (!this.cancelled && this.dataChannel?.readyState === 'open') {
+      this.dataChannel.send(JSON.stringify({ type: 'all-files-complete' }));
+    }
+  }
+
+  cancelTransfer() {
+    this.cancelled = true;
   }
 
   private resetConnectionState() {
     this.isNegotiating = false;
     this.hasCreatedOffer = false;
-    
+
     if (this.dataChannel) {
       this.dataChannel.close();
       this.dataChannel = null;
     }
-    
-    // Reset file transfer state
+
     this.receivedChunks = [];
     this.expectedFileSize = 0;
     this.receivedSize = 0;
@@ -620,28 +616,27 @@ export class WebRTCService {
     this.totalTransferred = 0;
     this.passcode = null;
     this.isPasscodeValidated = false;
-    
+    this.isReceivingMultiple = false;
+    this.expectedTotalFiles = 0;
+    this.cancelled = false;
+
     if (this.fileWriter) {
-      this.fileWriter.close();
+      this.fileWriter.close().catch(() => {});
       this.fileWriter = null;
     }
-    
-    this.downloadStream = null;
+
     this.isLargeFile = false;
   }
 
   disconnect() {
+    this.cancelled = true;
     this.resetConnectionState();
-    
-    // Clean up peer connection
     this.peerConnection.close();
-    
-    // Clean up socket connection
-    if (this.socket && this.socket.connected) {
+
+    if (this.socket?.connected) {
       this.socket.disconnect();
     }
-    
-    // Reset room state
+
     this.roomId = null;
     this.isInitiator = false;
   }

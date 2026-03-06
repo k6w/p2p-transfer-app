@@ -1,4 +1,4 @@
-const API_BASE_URL = 'http://localhost:3001';
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 
 export interface CreateRoomResponse {
   roomId: string;
@@ -14,6 +14,16 @@ export interface RoomInfo {
     size: number;
     type: string;
   };
+  multipleFilesInfo?: {
+    files: Array<{
+      id: string;
+      name: string;
+      size: number;
+      type: string;
+    }>;
+    totalSize: number;
+    hasPasscode: boolean;
+  };
 }
 
 export class ApiService {
@@ -26,30 +36,24 @@ export class ApiService {
     });
 
     if (!response.ok) {
-      throw new Error('Failed to create room');
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || 'Failed to create room');
     }
 
     return response.json();
   }
 
   static async getRoomInfo(roomId: string): Promise<RoomInfo> {
-    const response = await fetch(`${API_BASE_URL}/room/${roomId}`);
+    const response = await fetch(`${API_BASE_URL}/room/${encodeURIComponent(roomId)}`);
 
     if (!response.ok) {
       if (response.status === 404) {
-        throw new Error('Room not found');
+        throw new Error('Room not found or expired');
+      }
+      if (response.status === 400) {
+        throw new Error('Invalid room link');
       }
       throw new Error('Failed to get room info');
-    }
-
-    return response.json();
-  }
-
-  static async checkHealth(): Promise<{ status: string; timestamp: string }> {
-    const response = await fetch(`${API_BASE_URL}/health`);
-
-    if (!response.ok) {
-      throw new Error('Health check failed');
     }
 
     return response.json();

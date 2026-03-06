@@ -2,86 +2,140 @@ import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
-import { v4 as uuidv4 } from 'uuid';
+import { v4 as uuidv4, validate as uuidValidate } from 'uuid';
 
 const app = express();
 const server = createServer(app);
+
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+const PORT = process.env.PORT || 3001;
+const MAX_ROOMS = 1000;
+const MAX_PARTICIPANTS_PER_ROOM = 2;
+const ROOM_TTL_HOURS = 24;
+const EMPTY_ROOM_CLEANUP_MS = 5 * 60 * 1000;
+
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:5173",
-    methods: ["GET", "POST"]
+    origin: FRONTEND_URL,
+    methods: ['GET', 'POST']
   }
 });
 
-const PORT = process.env.PORT || 3001;
+const allowedOrigins = [FRONTEND_URL];
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  }
+}));
 
-// Store active rooms and their participants
+app.use(express.json({ limit: '1kb' }));
+
+app.disable('x-powered-by');
+
 const rooms = new Map();
-
-// Track socket to room mapping for cleanup
 const socketRoomMap = new Map();
 
-// Routes
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_MAX_REQUESTS = 20;
+
+function rateLimit(req, res, next) {
+  const ip = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+  const windowStart = now - RATE_LIMIT_WINDOW_MS;
+
+  if (!rateLimitMap.has(ip)) {
+    rateLimitMap.set(ip, []);
+  }
+
+  const requests = rateLimitMap.get(ip).filter(t => t > windowStart);
+  rateLimitMap.set(ip, requests);
+
+  if (requests.length >= RATE_LIMIT_MAX_REQUESTS) {
+    return res.status(429).json({ error: 'Too many requests' });
+  }
+
+  requests.push(now);
+  next();
+}
+
 app.get('/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Create a new room for file sharing
-app.post('/create-room', (req, res) => {
+app.post('/create-room', rateLimit, (req, res) => {
+  if (rooms.size >= MAX_ROOMS) {
+    return res.status(503).json({ error: 'Server is at capacity, try again later' });
+  }
+
   const roomId = uuidv4();
   rooms.set(roomId, {
     id: roomId,
     participants: [],
     createdAt: new Date(),
-    fileInfo: null
+    fileInfo: null,
+    multipleFilesInfo: null
   });
-  
-  res.json({ 
-    roomId, 
-    shareUrl: `http://localhost:5173/receive/${roomId}` 
+
+  res.json({
+    roomId,
+    shareUrl: `${FRONTEND_URL}/receive/${roomId}`
   });
 });
 
-// Get room info
 app.get('/room/:roomId', (req, res) => {
   const { roomId } = req.params;
+
+  if (!uuidValidate(roomId)) {
+    return res.status(400).json({ error: 'Invalid room ID format' });
+  }
+
   const room = rooms.get(roomId);
-  
+
   if (!room) {
     return res.status(404).json({ error: 'Room not found' });
   }
-  
+
   res.json({
     roomId: room.id,
     participantCount: room.participants.length,
-    hasFile: !!room.fileInfo,
-    fileInfo: room.fileInfo
+    hasFile: !!(room.fileInfo || room.multipleFilesInfo),
+    fileInfo: room.fileInfo,
+    multipleFilesInfo: room.multipleFilesInfo
   });
 });
 
-// Socket.io connection handling
 io.on('connection', (socket) => {
-  
-  // Join a room
   socket.on('join-room', (roomId) => {
+    if (!roomId || typeof roomId !== 'string' || !uuidValidate(roomId)) {
+      socket.emit('error', 'Invalid room ID');
+      return;
+    }
+
     const room = rooms.get(roomId);
     if (!room) {
       socket.emit('error', 'Room not found');
       return;
     }
-    
-    // Check if this socket is already in a room and clean up
+
+    if (room.participants.length >= MAX_PARTICIPANTS_PER_ROOM &&
+        !room.participants.find(p => p.id === socket.id)) {
+      socket.emit('error', 'Room is full');
+      return;
+    }
+
     const existingRoomId = socketRoomMap.get(socket.id);
     if (existingRoomId && existingRoomId !== roomId) {
       const existingRoom = rooms.get(existingRoomId);
       if (existingRoom) {
-        const participantIndex = existingRoom.participants.findIndex(p => p.id === socket.id);
-        if (participantIndex !== -1) {
-          existingRoom.participants.splice(participantIndex, 1);
+        const idx = existingRoom.participants.findIndex(p => p.id === socket.id);
+        if (idx !== -1) {
+          existingRoom.participants.splice(idx, 1);
           socket.to(existingRoomId).emit('user-left', {
             userId: socket.id,
             participantCount: existingRoom.participants.length
@@ -90,97 +144,121 @@ io.on('connection', (socket) => {
       }
       socket.leave(existingRoomId);
     }
-    
+
     socket.join(roomId);
     socketRoomMap.set(socket.id, roomId);
-    
-    // Check if user is already in the room (reconnection)
-    const existingParticipant = room.participants.find(p => p.id === socket.id);
-    if (!existingParticipant) {
+
+    if (!room.participants.find(p => p.id === socket.id)) {
       room.participants.push({
         id: socket.id,
         joinedAt: new Date()
       });
     }
-    
-    // Notify others in the room
+
     socket.to(roomId).emit('user-joined', {
       userId: socket.id,
       participantCount: room.participants.length
     });
-    
-    // Send current room state to the new user
+
     socket.emit('room-joined', {
       roomId,
       participantCount: room.participants.length,
-      fileInfo: room.fileInfo
+      fileInfo: room.fileInfo,
+      multipleFilesInfo: room.multipleFilesInfo
     });
   });
-  
-  // Set file info for a room (sender)
+
   socket.on('set-file-info', ({ roomId, fileInfo }) => {
+    if (!roomId || !fileInfo) return;
     const room = rooms.get(roomId);
     if (room) {
-      room.fileInfo = fileInfo;
-      socket.to(roomId).emit('file-info-updated', fileInfo);
+      room.fileInfo = {
+        name: String(fileInfo.name || '').slice(0, 500),
+        size: Number(fileInfo.size) || 0,
+        type: String(fileInfo.type || '').slice(0, 200)
+      };
+      socket.to(roomId).emit('file-info-updated', room.fileInfo);
     }
   });
-  
-  // WebRTC signaling
+
+  socket.on('set-multiple-files-info', ({ roomId, filesInfo }) => {
+    if (!roomId || !filesInfo) return;
+    const room = rooms.get(roomId);
+    if (room && Array.isArray(filesInfo.files)) {
+      room.multipleFilesInfo = {
+        files: filesInfo.files.slice(0, 100).map((f, i) => ({
+          id: `file-${i}`,
+          name: String(f.name || '').slice(0, 500),
+          size: Number(f.size) || 0,
+          type: String(f.type || '').slice(0, 200)
+        })),
+        totalSize: Number(filesInfo.totalSize) || 0,
+        hasPasscode: !!filesInfo.passcode
+      };
+      socket.to(roomId).emit('multiple-files-info-updated', room.multipleFilesInfo);
+    }
+  });
+
   socket.on('offer', ({ roomId, offer }) => {
+    if (!roomId || !offer) return;
     socket.to(roomId).emit('offer', { offer, senderId: socket.id });
   });
-  
+
   socket.on('answer', ({ roomId, answer }) => {
+    if (!roomId || !answer) return;
     socket.to(roomId).emit('answer', { answer, senderId: socket.id });
   });
-  
+
   socket.on('ice-candidate', ({ roomId, candidate }) => {
+    if (!roomId || !candidate) return;
     socket.to(roomId).emit('ice-candidate', { candidate, senderId: socket.id });
   });
-  
-  // Handle disconnection
+
   socket.on('disconnect', () => {
-    
-    // Get the room this socket was in
     const roomId = socketRoomMap.get(socket.id);
     if (roomId) {
       const room = rooms.get(roomId);
       if (room) {
-        const participantIndex = room.participants.findIndex(p => p.id === socket.id);
-        if (participantIndex !== -1) {
-          room.participants.splice(participantIndex, 1);
+        const idx = room.participants.findIndex(p => p.id === socket.id);
+        if (idx !== -1) {
+          room.participants.splice(idx, 1);
           socket.to(roomId).emit('user-left', {
             userId: socket.id,
             participantCount: room.participants.length
           });
-          
-          // Clean up empty rooms after 5 minutes
+
           if (room.participants.length === 0) {
             setTimeout(() => {
               if (rooms.has(roomId) && rooms.get(roomId).participants.length === 0) {
                 rooms.delete(roomId);
               }
-            }, 5 * 60 * 1000);
+            }, EMPTY_ROOM_CLEANUP_MS);
           }
         }
       }
-      // Clean up socket mapping
       socketRoomMap.delete(socket.id);
     }
   });
 });
 
-// Clean up old rooms periodically (24 hours)
 setInterval(() => {
   const now = new Date();
-  rooms.forEach((room, roomId) => {
+  for (const [roomId, room] of rooms) {
     const ageInHours = (now - room.createdAt) / (1000 * 60 * 60);
-    if (ageInHours > 24) {
+    if (ageInHours > ROOM_TTL_HOURS) {
       rooms.delete(roomId);
     }
-  });
-}, 60 * 60 * 1000); // Run every hour
+  }
 
-server.listen(PORT, () => {
-});
+  const windowStart = Date.now() - RATE_LIMIT_WINDOW_MS;
+  for (const [ip, requests] of rateLimitMap) {
+    const filtered = requests.filter(t => t > windowStart);
+    if (filtered.length === 0) {
+      rateLimitMap.delete(ip);
+    } else {
+      rateLimitMap.set(ip, filtered);
+    }
+  }
+}, 60 * 60 * 1000);
+
+server.listen(PORT, () => {});
