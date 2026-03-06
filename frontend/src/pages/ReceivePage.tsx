@@ -34,6 +34,7 @@ export function ReceivePage() {
   const [passcodeValidated, setPasscodeValidated] = useState(false);
   const [allFilesReceived, setAllFilesReceived] = useState(false);
   const [passcodeError, setPasscodeError] = useState(false);
+  const initedRef = useRef(false);
 
   useEffect(() => {
     if (!roomId) {
@@ -42,6 +43,9 @@ export function ReceivePage() {
       return;
     }
 
+    if (initedRef.current) return;
+    initedRef.current = true;
+
     loadRoomInfo();
 
     return () => {
@@ -49,6 +53,7 @@ export function ReceivePage() {
         webrtcRef.current.disconnect();
         webrtcRef.current = null;
       }
+      initedRef.current = false;
     };
   }, [roomId]);
 
