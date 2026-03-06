@@ -48,6 +48,7 @@ export class WebRTCService {
   private senderPasscode: string | null = null;
   private senderFiles: File[] | null = null;
   private passcodeGateActive = false;
+  private dataChannelReadyResolvers: Array<() => void> = [];
 
   public onConnectionStateChange?: (state: RTCPeerConnectionState) => void;
   public onDataChannelOpen?: () => void;
@@ -172,6 +173,10 @@ export class WebRTCService {
 
     channel.onopen = () => {
       this.onDataChannelOpen?.();
+      for (const resolve of this.dataChannelReadyResolvers) {
+        resolve();
+      }
+      this.dataChannelReadyResolvers = [];
     };
 
     channel.onclose = () => {
@@ -376,25 +381,22 @@ export class WebRTCService {
   }
 
   private async waitForDataChannel(): Promise<boolean> {
-    if (!this.dataChannel) {
-      this.onError?.('data channel not created');
-      return false;
-    }
-
-    if (this.dataChannel.readyState === 'open') {
+    if (this.dataChannel?.readyState === 'open') {
       return true;
     }
 
     return new Promise<boolean>((resolve) => {
-      const timeout = setTimeout(() => resolve(false), DATA_CHANNEL_TIMEOUT);
+      const timeout = setTimeout(() => {
+        this.dataChannelReadyResolvers = this.dataChannelReadyResolvers.filter(r => r !== onReady);
+        resolve(false);
+      }, DATA_CHANNEL_TIMEOUT);
 
-      const onOpen = () => {
+      const onReady = () => {
         clearTimeout(timeout);
-        this.dataChannel?.removeEventListener('open', onOpen);
         resolve(true);
       };
 
-      this.dataChannel?.addEventListener('open', onOpen);
+      this.dataChannelReadyResolvers.push(onReady);
     });
   }
 
