@@ -123,6 +123,7 @@ export function ReceivePage() {
       };
 
       webrtc.onPasscodeValidated = (isValid) => {
+        setSubmittingPasscode(false);
         if (isValid) {
           setPasscodeValidated(true);
           setPasscodeError(false);
@@ -142,6 +143,7 @@ export function ReceivePage() {
       };
 
       webrtc.onError = (err) => {
+        setSubmittingPasscode(false);
         setError(err);
         toast.error(err);
       };
@@ -185,7 +187,6 @@ export function ReceivePage() {
     setPasscodeError(false);
     setSubmittingPasscode(true);
     await webrtcRef.current.submitPasscode(passcode);
-    setSubmittingPasscode(false);
   };
 
   const getStatusText = () => {
@@ -305,7 +306,7 @@ export function ReceivePage() {
                   {submittingPasscode ? (
                     <>
                       <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                      connecting...
+                      verifying...
                     </>
                   ) : (
                     'submit passcode'

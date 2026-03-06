@@ -102,7 +102,7 @@ export class WebRTCService {
     this.socket.on('user-joined', ({ participantCount }) => {
       this.onUserJoined?.(participantCount);
 
-      if (this.isInitiator && participantCount === 2 &&
+      if (this.isInitiator && participantCount >= 2 &&
           this.peerConnection.signalingState === 'stable' &&
           !this.hasCreatedOffer && !this.isNegotiating) {
         this.createOffer();
@@ -111,6 +111,31 @@ export class WebRTCService {
 
     this.socket.on('user-left', ({ participantCount }) => {
       this.onUserLeft?.(participantCount);
+
+      if (this.isInitiator) {
+        this.hasCreatedOffer = false;
+        this.isNegotiating = false;
+
+        if (this.dataChannel) {
+          this.dataChannel.close();
+          this.dataChannel = null;
+        }
+
+        this.peerConnection.close();
+        this.peerConnection = new RTCPeerConnection({
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+          ],
+        });
+        this.setupPeerConnectionListeners();
+
+        this.dataChannel = this.peerConnection.createDataChannel('fileTransfer', {
+          ordered: true,
+          maxRetransmits: 3,
+        });
+        this.setupDataChannel(this.dataChannel);
+      }
     });
 
     this.socket.on('file-info-updated', (fileInfo: FileInfo) => {
