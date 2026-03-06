@@ -297,13 +297,17 @@ export class WebRTCService {
     }
   }
 
-  submitPasscode(passcode: string) {
-    if (this.dataChannel?.readyState === 'open') {
-      this.dataChannel.send(JSON.stringify({
-        type: 'passcode-submit',
-        passcode,
-      }));
+  async submitPasscode(passcode: string) {
+    const isReady = await this.waitForDataChannel();
+    if (!isReady || !this.dataChannel) {
+      this.onError?.('not connected to sender yet. try again.');
+      return;
     }
+
+    this.dataChannel.send(JSON.stringify({
+      type: 'passcode-submit',
+      passcode,
+    }));
   }
 
   private reconstructFile() {
